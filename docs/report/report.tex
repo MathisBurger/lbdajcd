@@ -1,0 +1,562 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  language=Java
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Logic-Based Deletion Analysis of Java Code Dependencies\\[0.3em]
+\large A Prototype for Giving Feedback to AI Coding Assistants}
+\author{Mathis Burger}
+\date{24 October 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+AI coding assistants change and delete code without knowing reliably what
+depends on it. This document describes a prototype that encodes code-level
+dependencies of a Java project as a feature model, translates it to
+propositional logic and answers deletion questions on this logical
+encoding: \emph{Can this class or member be deleted? If not, which
+functionality breaks, and why?} The encoding and five queries (including
+two MaxSAT queries and an explanation via a minimal unsatisfiable subset)
+are specified and implemented on top of the SAT solver Sat4j. For the
+constraints implemented so far, the encoding lies in a fragment that
+propagation alone can solve; where a SAT solver becomes necessary is one
+of the open research questions. A source extractor based on
+JavaParser builds the feature tree and the plain references between code
+elements. The queries have been checked on a small hand-built example.
+An end-to-end run from source on the same example works, but answers only
+some of the queries correctly, because the extractor does not yet produce
+roots and polymorphism constraints. A run on a real project and an
+evaluation have not been done.
+\end{abstract}
+
+\begin{center}
+\fbox{\begin{minipage}{0.92\textwidth}
+\textbf{Nature of this document.}
+This is a write-up of a prototype, not a research paper. Its purpose is
+to show that the research I propose is implementable and to make its
+central idea concrete. It does not yet show that the approach works on
+real projects: no evaluation has been run, and the extractor covers only
+part of the encoding. The related work in Section~\ref{sec:related} is
+preliminary and mostly based on abstracts.
+
+\medskip
+\textbf{Use of AI.}
+AI assistants (Claude Code) were used to draft text and code in this
+project. I checked all code and text personally. The research idea and the
+design decisions are my own.
+\end{minipage}}
+\end{center}
+
+\section{Motivation and Question}
+
+When an AI coding assistant proposes to delete a class, it usually learns
+whether this was safe only after compiling and running the tests, or not
+at all. A tool that answers deletion questions \emph{before} the change,
+and explains its answer, could serve as feedback for the assistant's
+decision.
+
+The question behind the prototype is:
+
+\begin{quote}
+Can a propositional encoding of code-level dependencies, solved with a
+SAT solver where necessary, tell an AI coding assistant, before
+compilation or testing, whether a proposed deletion breaks the project?
+Concretely: can class or member $C$ be deleted? If not, which
+functionality breaks, and why?
+\end{quote}
+
+The phrase ``where necessary'' matters: as Section~\ref{sec:complexity}
+shows, the constraints implemented so far do not require a SAT solver.
+Finding out which rules about code do require one is part of the
+question.
+
+The approach borrows from two areas. Package managers have long encoded
+dependencies between packages as propositional formulas and solved them
+with SAT solvers. Software product lines describe valid combinations of
+features as feature models, which also translate to propositional logic.
+The prototype applies both ideas at the level of classes, fields,
+constructors and methods.
+
+\section{Preliminary Related Work}\label{sec:related}
+
+This section lists the work found so far. It is not a systematic review.
+For most entries only the abstract has been read.
+
+\paragraph{Feature models and propositional logic.}
+Batory~\cite{batory2005} connects feature models, grammars and
+propositional formulas, so that feature models can be translated to
+propositional logic and analysed with off-the-shelf SAT solvers. Kuiter et
+al.~\cite{kuiter2022} show that the choice of CNF transformation affects
+the correctness and performance of feature-model analyses; the encoding
+here avoids the question because every constraint is already a single
+clause. Sundermann et al.~\cite{sundermann2023} evaluate \#SAT solvers on
+industrial feature models, which becomes relevant if one wants to count
+valid deletion sets.
+
+\paragraph{SAT on code-level references.}
+The closest prior work found is \emph{safe composition} by Thaker et
+al.~\cite{thaker2007}: feature modules of a product line reference classes,
+methods and fields defined in other modules, and SAT is used to check that
+no product allowed by the feature model contains a reference to an
+undefined element. Apel et al.~\cite{apel2010} and K\"astner et
+al.~\cite{kaestner2012} give type systems that guarantee all variants of a
+product line are well-typed. How the proposed research relates to this
+line of work is discussed in Section~\ref{sec:questions}.
+
+\paragraph{SAT-based package dependency solving.}
+Mancinelli et al.~\cite{mancinelli2006} encode package installability as a
+SAT problem, with one Boolean variable per package version, and check
+whole Debian and Mandriva repositories with it. Abate et
+al.~\cite{abate2020} survey dependency solving in package managers, note
+that it is NP-complete in non-trivial component models, and observe that
+SAT-based solving is spreading. Sat4j~\cite{leberre2010}, the solver used
+here, provides SAT, MaxSAT and pseudo-Boolean solving in Java and has been
+used for Eclipse's plugin dependency management. Pinckney et
+al.~\cite{pinckney2023} use Max-SMT to optimise npm dependency solving.
+
+\paragraph{Breaking changes and LLM feedback.}
+BUMP~\cite{reyes2024} is a benchmark of reproducible breaking dependency
+updates in Java projects. Roseau
+\cite{latappy2025} detects API breaking changes in Java libraries.
+CodePlan~\cite{bairi2023} uses static dependency analysis to plan
+repository-wide edits made by an LLM; it does not use SAT.
+
+\section{Approach}
+
+The full specification is in \code{docs/encoding.md} in the repository.
+This section summarises it.
+
+\subsection{Features}
+
+Every feature is one Boolean variable: \emph{true} means the element is
+present in the code, \emph{false} that it is deleted. The feature tree is
+\[
+  \text{project root} \to \text{package} \to \text{class}
+  \to \text{field / constructor / method},
+\]
+with named nested classes as children of their enclosing class. Each
+overload of a method or constructor is its own feature, identified by its
+parameter types (e.g.\ \code{Report\#total(Shape)}). Parameters are not
+separate features. Anonymous classes, local classes and lambdas are not
+features; their references are attributed to the enclosing member. JDK and
+library types are not modelled.
+
+\subsection{Constraints}
+
+Every constraint is a single clause; $a \to b$ stands for
+$\neg a \lor b$.
+\begin{itemize}
+  \item \textbf{Tree:} the project root is present; every child requires its
+        parent ($\mathit{child} \to \mathit{parent}$). All other features are
+        optional and therefore deletion candidates.
+  \item \textbf{References:} the innermost feature containing a reference
+        (its \emph{source}) requires the referenced feature: method and
+        constructor calls (bound to the overload the compiler resolves),
+        type usages, inheritance, annotations and field accesses.
+  \item \textbf{Polymorphism:} for an interface or abstract class $T$ with
+        implementations $C_1,\dots,C_n$, an or-group
+        $T \to (C_1 \lor \dots \lor C_n)$; a call on an abstract method
+        requires the declaration and at least one implementation; a concrete
+        class requires its implementation of every inherited abstract method.
+        Lambdas count as implementations through their enclosing member.
+        Groups without any implementation in the project are skipped.
+  \item \textbf{Roots} (``functionality''): every \code{main} method and
+        every test class is a root and must be present; a root class
+        requires all of its members.
+  \item \textbf{Deletion} of a set $D$: unit clauses $\neg d$ for
+        $d \in D$.
+\end{itemize}
+
+\subsection{Queries}
+
+Let $F$ be all clauses except the root unit clauses, $R$ the root unit
+clauses and $D$ the deletion set.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+& Question & Query \\
+\midrule
+Q1 & Can $D$ be deleted alone? &
+  SAT of $F \land R \land \neg D$ under the assumption that every feature
+  outside the deleted subtrees stays present \\
+Q2 & Can $D$ be deleted together with dependent code? &
+  SAT of $F \land R \land \neg D$ \\
+Q3 & Which code must go with $D$? &
+  MaxSAT: $F \land \neg D$ hard, one soft unit clause per remaining feature \\
+Q4 & Which functionality breaks? &
+  MaxSAT: $F \land \neg D$ hard, one soft unit clause per root \\
+Q5 & Why? &
+  Minimal unsatisfiable subset (MUS) of the Q2 formula; each clause keeps
+  the code reference that produced it \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Complexity, and why SAT is used anyway}\label{sec:complexity}
+
+Every clause of the encoding has at most one negative literal, so the
+formulas are \emph{dual-Horn}. Their satisfiability can be decided in
+linear time: negating every variable turns them into Horn formulas, for
+which Dowling and Gallier~\cite{dowling1984} give a linear-time
+algorithm.
+Moreover, the set of models is closed under union: if $a$ is true in
+$M_1 \cup M_2$, it is true in some $M_i$, which then makes one of the
+positive literals of every clause $\neg a \lor b_1 \lor \dots \lor b_k$
+true in $M_i$ and therefore in the union. Hence a unique maximal model
+exists, computable by propagating ``absent'' from $D$ to a fixpoint, and it
+answers Q2--Q4 at once. This is only a proof sketch and still has to be
+checked carefully.
+
+For the current encoding, a graph or propagation algorithm therefore gives
+the same answers as SAT and MaxSAT. Explanations are not an argument for
+SAT either: in this fragment, the chain of implications that forced a
+feature to be absent can be read directly from the propagation. Using a
+solver library is merely convenient here, because it provides minimal
+unsatisfiable subsets without extra implementation effort. The actual
+reason to keep a SAT solver is that planned user-defined rules
+(``exactly one implementation'', ``A excludes B'') contain clauses with
+more than one negative literal and therefore leave the dual-Horn
+fragment, so that efficient propagation is no longer guaranteed. This
+reason is prospective: whether such rules are needed in practice has not
+been shown. The propagation algorithm will serve as a baseline in the
+evaluation.
+
+\section{Prototype}
+
+The prototype is a Maven project in Java~21 with Sat4j~2.3.6 and
+JavaParser~3.28.2 (including its symbol solver), tested with JUnit~5.
+
+\begin{itemize}
+  \item \code{FeatureModel} and \code{Constraint} hold the model in clause
+        form. Each clause keeps a human-readable reason, so that a MUS can be
+        traced back to the code.
+  \item \code{DeletionQueries} implements Q1--Q5: Q1 and Q2 with Sat4j's
+        default solver (Q1 via assumptions), Q3 and Q4 with Sat4j's weighted
+        MaxSAT decorator, Q5 with Sat4j's \code{Xplain}.
+  \item \code{Extractor} builds the model from source in layers. Implemented
+        are layer~1 (the feature tree) and layer~2 (inheritance, type usage,
+        annotations, field access, constructor calls, resolved with the
+        JavaParser symbol solver). Names that cannot be resolved, such as
+        library annotations, are reported as warnings.
+\end{itemize}
+
+Not implemented are layer~3 (method calls and implicit \code{super()}
+calls), layer~4 (polymorphism) and layer~5 (roots); see
+Section~\ref{sec:limitations}. The pipeline nevertheless runs end to end
+on the partial model; Section~\ref{sec:checked} shows what it gets right
+and wrong.
+
+\section{Worked Example}
+
+Example A is a small synthetic program with an interface and two
+implementations:
+
+\begin{lstlisting}
+interface Shape { double area(); }
+class Circle implements Shape { public double area() { return 1; } }
+class Square implements Shape { public double area() { return 1; } }
+class Report { static double total(Shape s) { return s.area(); } }
+class ReportTest { @Test void total() { Report.total(new Circle()); } }
+\end{lstlisting}
+
+Its model has 12 features (project root, package \code{p}, the five classes
+and their five members) and 24 clauses. The root is \code{ReportTest}.
+Three deletions were worked out by hand:
+
+\begin{center}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Deletion & Q1 & Q2 & Q3 cascade & Q4 broken roots \\
+\midrule
+\code{Square} & yes & yes & \code{Square}, \code{Square\#area()} & none \\
+\code{Circle} & no & no & \code{Circle}, \code{Circle\#area()}, & \code{ReportTest} \\
+ & & & \code{ReportTest\#total()}, \code{ReportTest} & \\
+\code{Square\#area()} & no & yes & \code{Square\#area()}, \code{Square} & none \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \code{Square} can be deleted because \code{Circle} still satisfies
+        the or-group of \code{Shape} and the call \code{s.area()}. This is
+        the case the or-groups exist for.
+  \item \code{Circle} cannot be deleted. The explanation (Q5) is the MUS
+        \{\code{ReportTest} is a root; \code{ReportTest} requires
+        \code{ReportTest\#total()}; \code{ReportTest\#total()} calls
+        \code{new Circle()}; \code{Circle} is deleted\}.
+  \item \code{Square\#area()} cannot be deleted alone, because
+        \code{Square} would no longer implement \code{Shape}; it can be
+        deleted together with \code{Square}.
+\end{itemize}
+
+\section{What Has Been Checked}\label{sec:checked}
+
+All numbers in this section come from \code{mvn test} in the repository
+(12 tests, all passing on 24 October 2026).
+
+\begin{itemize}
+  \item \code{ExampleATest} (4 tests): the hand-built model of Example A
+        consists of exactly the 24 documented clauses, and Sat4j's answers to
+        Q1--Q5 for the three deletions above equal the hand-derived ones,
+        including the exact MUS.
+  \item \code{ExtractorTreeTest} (3 tests): the extracted feature tree of
+        Example A equals the hand-built one; a second fixture covers
+        overloads, generic and varargs parameters, nested classes, enums,
+        interfaces, records and nested packages, and checks that anonymous
+        and local classes, lambdas and initializer blocks do not become
+        features; variable numbering is deterministic.
+  \item \code{ExtractorReferenceTest} (2 tests): layer~2 produces exactly the
+        four plain-reference clauses of Example A, and 15 hand-derived
+        clauses for a fixture covering inheritance, annotations, generic
+        field types, enum constants, static initializers, explicit
+        \code{super(\dots)}, implicit and explicit constructors, casts,
+        class literals, inherited fields, and references from lambdas and
+        anonymous classes.
+  \item \code{EndToEndTest} (3 tests): the sources of Example A are
+        extracted with layers~1 and~2 only, and the queries run on the
+        resulting model. The test asserts the answers derived by hand for
+        this partial model (\code{docs/encoding.md}, Section~5), including
+        the ones that are wrong compared with the full model.
+\end{itemize}
+
+These tests show that the encoding, the queries and the first two
+extractor layers behave as specified on small examples.
+
+\paragraph{End to end with layers 1 and 2 only.}
+The extracted model of Example A contains the feature tree and the four
+plain references, but no method calls, no or-group, no implementation
+obligations and no roots. Its answers compare with those of the full model
+as follows:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Deletion & Q1 alone & Q2 with cascade & Same as full model \\
+\midrule
+\code{Square} & yes & yes & yes, Q1--Q4 \\
+\code{Circle} & no & yes (full: no) & Q1 only \\
+\code{Square\#area()} & yes (full: no) & yes & Q2 and Q4 only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Deleting \code{Circle} is still correctly rejected by Q1, because the test
+calls \code{new Circle()}. Without roots, however, nothing has to stay
+present: Q2 accepts the deletion, the cascade (Q3) misses
+\code{ReportTest}, no functionality is reported broken (Q4), and there is
+nothing to explain (Q5). Without the implementation obligation, even Q1
+accepts deleting \code{Square\#area()}, although \code{Square} would then no
+longer compile. The run therefore shows that the pipeline works from
+source to answer, and which of the missing layers each answer depends on:
+roots (layer~5) for Q2, Q4 and Q5, and polymorphism (layer~4) even for
+Q1.
+
+\section{Open Questions and How the Research Would Address Them}\label{sec:questions}
+
+The prototype raises several questions that it cannot answer itself. This
+section states them openly, together with how I would address them in
+the research. The points in it are arguments and hypotheses, not results.
+
+\paragraph{Why not simply compile and run the tests?}
+Compiling and testing remain the ground truth, and the evaluation would
+use them as such. The tool is meant to complement them, not to replace
+them. A compiler answers a question only after the edit has been made,
+and it reports the errors of that one edit. The queries in this
+prototype answer questions the compiler does not answer directly: whether
+a deletion is possible \emph{before} the code is touched, what else would
+have to be removed with it (Q3), which tests and entry points would be
+lost (Q4), and why (Q5), as a chain of references rather than a list of
+error messages. A single model can also be asked about many candidate
+deletions without rebuilding the project each time. Whether this is
+faster than incremental compilation in practice, and whether the
+explanations help an AI assistant, are open questions that the
+evaluation would have to measure.
+
+\paragraph{Why SAT, if the current encoding is dual-Horn?}
+For the constraints implemented so far, a SAT solver is not necessary
+(Section~\ref{sec:complexity}), and the explanations could also be
+obtained from propagation. I do not see this as a reason to drop the
+approach, but it changes how the research question should be read: the
+contribution is a \emph{logical encoding} of code-level dependencies
+together with deletion queries and explanations, with SAT as a general
+back end for the cases that need it. A central part of the research would be to find out where the boundary
+lies, that is, which kinds of rules about code keep the problem in an
+efficiently solvable fragment and which do not. Candidates that leave the
+dual-Horn fragment are user-defined rules such as ``exactly one
+implementation of this interface'' or ``these two components exclude each
+other''. Whether such rules occur often enough in practice to matter is
+itself an open question. If they do not, a propagation algorithm would be
+sufficient, and that would be a result worth reporting as well. Until
+this is known, I favour SAT as the back end, because rules outside the
+dual-Horn fragment can then be added as further clauses without changing
+the solver. Such constraints (e.g.\ $A \land B \to \neg C$) are better
+handled by SAT than by a custom graph algorithm: propagation alone no
+longer finds the answer, so the graph algorithm would have to add the
+search that a SAT solver already provides. How well the SAT and especially the MaxSAT queries scale on
+real projects has not been measured yet.
+
+\paragraph{What is new compared to safe composition?}
+Thaker et al.~\cite{thaker2007} already encode code references as
+propositional constraints between feature modules and check them with
+SAT. The research would build on
+this idea rather than claim it. The first intended difference is the
+granularity: in safe composition a variable stands for a feature module,
+and a reference only yields an implication between modules, whereas here
+every class, field, constructor and method is a variable of its own. This
+is what makes the deletion of a single element expressible at all.
+Further differences are the input (an ordinary project from which the model is
+extracted automatically, not a product line with a hand-written feature
+model), the question (the impact of one concrete deletion, the cascade
+and the minimal set of broken functionality, rather than type safety of
+all products) and the consumer (an AI assistant that needs an answer and
+an explanation). Whether these differences hold up can only be judged
+after a thorough reading of this line of work, which I plan as a first
+step.
+
+\paragraph{Where is the AI?}
+The prototype contains no AI. It focuses on the part that has to work
+first: a reliable answer to a deletion question. The AI-related question,
+whether an assistant makes better decisions when it can ask the tool,
+is a separate experiment. It would only make sense once the tool itself
+has been evaluated against compilation and test results.
+
+\paragraph{Does it work on real code?}
+Only for one five-class example, and only partly
+(Section~\ref{sec:checked}). The first milestone of the research would be
+a complete end-to-end run: completing the extractor, deleting each class of a small
+open-source subject in turn, and comparing the prediction with the result
+of compiling and running its tests. False positives and false negatives
+would be reported as they are, including the ones the current design
+already predicts (Section~\ref{sec:limitations}).
+
+As a first subject I propose
+\href{https://github.com/iluwatar/java-design-patterns}{java-design-patterns},
+an open-source collection of the common Java design patterns. Its modules
+are small and well understood, so answers can be checked by hand, and the
+patterns they demonstrate recur in real Java code. The modules themselves,
+however, are demonstrations and are not structured like real projects. To
+cover that, a large open-source project such as Apache Kafka would be
+analysed as well; judging whether an answer is correct there requires
+in-depth knowledge of the codebase, which would have to be built up
+first. A more focused variant of the research would
+first analyse which design patterns occur in practice and how relevant
+they are, and then study how each of them is represented in the
+encoding.
+
+Two points of the evaluation design need care. First, the ground truth
+differs per query. For Q1, it is the result of deleting only $C$ and then
+compiling and running the tests. For Q2 and Q3, it is the result of
+deleting the predicted cascade instead: the prediction is correct if the
+project then compiles and only the predicted roots (Q4) are lost.
+Second, the answers are likely to be imbalanced. In the
+\code{strategy} module of the planned subject, for example, the
+\code{main} method uses every strategy class, so almost none of them can
+be deleted. A trivial
+predictor that always answers ``not deletable'' would then look
+accurate. The evaluation would therefore report measures that account
+for imbalance, such as precision and recall per answer, rather than
+accuracy alone, and compare against three baselines of increasing
+strength: ``always not deletable''; plain reachability, which treats every
+reference as required and ignores or-groups, so it cannot see that
+another implementation takes over; and the propagation algorithm of
+Section~\ref{sec:complexity}, which gives the same answers as the
+encoding in the dual-Horn fragment and therefore isolates the cost and
+benefit of using a solver. Subjects with more deletable code would also
+be needed.
+
+\paragraph{Is deletion too narrow?}
+Deletion is a deliberately small starting point because its ground truth
+is clear. Other changes can partly be expressed through it: changing a
+method's signature, for example, amounts to deleting one overload and
+adding another. Whether the approach extends to other kinds of edits is
+part of the future work.
+
+\section{Limitations}\label{sec:limitations}
+
+\begin{itemize}
+  \item \textbf{Partial end-to-end result, no evaluation.} The extractor
+        lacks method calls, polymorphism and roots. From source, only one
+        synthetic example has been run, and several of its answers are wrong
+        for that reason (Section~\ref{sec:checked}). The planned subject
+        (java-design-patterns, Section~\ref{sec:questions}) has not been
+        run.
+  \item \textbf{Resolved overload only.} A call requires exactly the
+        overload the compiler picks today. If \code{bar(int)} is deleted,
+        \code{bar(5)} still compiles against \code{bar(long)}, but the model
+        reports a break (false positive).
+  \item \textbf{Implicit \code{super()}} calls are not modelled yet, so
+        deleting a superclass's no-argument constructor can break
+        compilation unnoticed (false negative).
+  \item \textbf{Static analysis only.} Reflection, dependency injection,
+        \code{ServiceLoader}, references from resource files, generated code
+        (e.g.\ Lombok), runtime-created implementations (mocks, proxies) and
+        breakage that compiles but fails a test are out of scope. Mocks in
+        particular cause false positives: a test that uses only a Mockito
+        mock of an interface still passes when every implementation is
+        deleted, but the or-group reports it as broken.
+  \item \textbf{Approximate signatures.} Overloads are identified by
+        parameter types as written in the source, so type variables are not
+        erased to their bounds and equally named types are not told apart.
+        Identifying each parameter type by its resolved, fully qualified
+        name would fix this.
+  \item \textbf{Dual-Horn fragment.} As shown above, the current encoding
+        does not need a SAT solver; the benefit of SAT has to be shown with
+        rules outside this fragment (Section~\ref{sec:questions}).
+  \item \textbf{Preliminary literature review.} The related work is
+        incomplete and mostly based on abstracts.
+\end{itemize}
+
+\section{Next Steps for the Research}
+
+\textbf{NOTE:} Order is not prioritised.
+
+\begin{itemize}
+  \item Complete the extractor (method calls, implicit \code{super()},
+        polymorphism, roots) and run the queries end to end.
+  \item Implement the propagation baseline and compare it with SAT.
+  \item Evaluate on open-source projects, starting with
+        java-design-patterns: delete each class in turn, compare
+        the prediction with compiling and running the tests (for Q2 and Q3:
+        after deleting the predicted cascade), and report precision and
+        recall per answer, false positives and negatives, and solver time,
+        compared against trivial baselines and the propagation algorithm.
+  \item Add user-defined rules in UVL constraint syntax (e.g.\ exactly one
+        implementation), which leave the dual-Horn fragment, and determine
+        the complexity of the resulting problem.
+  \item Render explanations as text for an AI assistant and study whether
+        the assistant decides better with the tool.
+  \item Extend from single projects to services in several languages. Many
+        dependencies between services (e.g.\ HTTP calls built from
+        configuration values) cannot be proven by static analysis. An AI
+        could infer them, and the encoding would need to include them
+        together with their uncertainty, so that an answer shows which parts
+        rest on proven dependencies and which on inferred ones.
+  \item Carry out a proper literature review, starting with reading the
+        safe-composition and variability-aware type-checking work in full.
+\end{itemize}
+
+\bibliographystyle{plainurl}
+\bibliography{references}
+
+\end{document}

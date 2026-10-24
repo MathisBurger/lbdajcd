@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>satdeps</groupId>
+  <artifactId>coding-prototype</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <name>SAT-based code dependency analysis</name>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <sat4j.version>2.3.6</sat4j.version>
+    <javaparser.version>3.28.2</javaparser.version>
+    <junit.version>5.14.4</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.ow2.sat4j</groupId>
+      <artifactId>org.ow2.sat4j.core</artifactId>
+      <version>${sat4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.ow2.sat4j</groupId>
+      <artifactId>org.ow2.sat4j.maxsat</artifactId>
+      <version>${sat4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.javaparser</groupId>
+      <artifactId>javaparser-core</artifactId>
+      <version>${javaparser.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.javaparser</groupId>
+      <artifactId>javaparser-symbol-solver-core</artifactId>
+      <version>${javaparser.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>
